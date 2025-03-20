@@ -1,16 +1,26 @@
 mod model;
 
-use actix_web::web::ServiceConfig;
 use actix_web::{get, post, web, HttpResponse};
 use model::User;
 use mongodb::{bson::doc, options::IndexOptions, Client, Collection, IndexModel};
 use shuttle_actix_web::ShuttleActixWeb;
 use shuttle_runtime::SecretStore;
 use shuttle_runtime::__internals::Context;
+use utoipa::OpenApi;
+use utoipa_swagger_ui::SwaggerUi;
 
 const DB_NAME: &str = "preprod";
 const COLL_NAME: &str = "users";
 
+#[utoipa::path(
+    post,
+    path = "/add_user",
+    request_body = User,
+    responses(
+        (status = 200, description = "User added"),
+        (status = 500, description = "Internal Server Error")
+    )
+)]
 #[post("/add_user")]
 async fn add_user(client: web::Data<Client>, form: web::Form<User>) -> HttpResponse {
     let collection = client.database(DB_NAME).collection(COLL_NAME);
@@ -21,6 +31,18 @@ async fn add_user(client: web::Data<Client>, form: web::Form<User>) -> HttpRespo
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/get_user/{username}",
+    params(
+        ("username" = String, Path, description = "The username to lookup")
+    ),
+    responses(
+        (status = 200, description = "User found", body = User),
+        (status = 404, description = "User not found"),
+        (status = 500, description = "Internal Server Error")
+    )
+)]
 #[get("/get_user/{username}")]
 async fn get_user(client: web::Data<Client>, username: web::Path<String>) -> HttpResponse {
     let username = username.into_inner();
@@ -48,10 +70,20 @@ async fn create_username_index(client: &Client) {
         .expect("creating an index should succeed");
 }
 
+#[derive(OpenApi)]
+#[openapi(
+    paths(add_user, get_user),
+    components(schemas(User)),
+    tags(
+        (name = "user", description = "User API")
+    )
+)]
+struct ApiDoc;
+
 #[shuttle_runtime::main]
 async fn main(
     #[shuttle_runtime::Secrets] secrets: SecretStore,
-) -> ShuttleActixWeb<impl FnOnce(&mut ServiceConfig) + Send + Clone + 'static> {
+) -> ShuttleActixWeb<impl FnOnce(&mut web::ServiceConfig) + Send + Clone + 'static> {
     let mongodb_uri = secrets.get("MONGODB_URI").context("secret was not found")?;
     let client = Client::with_uri_str(&mongodb_uri)
         .await
@@ -61,10 +93,14 @@ async fn main(
 
     let client_data = web::Data::new(client);
 
-    let config = move |cfg: &mut ServiceConfig| {
+    let config = move |cfg: &mut web::ServiceConfig| {
         cfg.app_data(client_data.clone())
             .service(add_user)
-            .service(get_user);
+            .service(get_user)
+            .service(
+                SwaggerUi::new("/swagger-ui/{_:.*}")
+                    .url("/api-doc/openapi.json", ApiDoc::openapi()),
+            );
     };
 
     Ok(config.into())

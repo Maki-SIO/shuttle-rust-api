@@ -10,3 +10,5 @@ mongodb = "3.2.3"
 serde = "1.0.219"
 shuttle-actix-web = "0.53.0"
 shuttle-runtime = "0.53.0"
+utoipa = { version = "5.3.1", features = ["actix_extras"] }
+utoipa-swagger-ui = { version = "9.0.0", features = ["actix-web"] }
