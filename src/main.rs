@@ -1,8 +1,11 @@
 mod model;
 
+use actix_web::body::MessageBody;
+use actix_web::dev::{ServiceRequest, ServiceResponse};
+use actix_web::middleware::{from_fn, Next};
 use actix_web::web::Json;
-use actix_web::{get, post, web, HttpResponse};
-use jsonwebtoken::{encode, EncodingKey, Header};
+use actix_web::{error, get, middleware, post, web, Error, HttpResponse};
+use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use model::User;
 use mongodb::{bson::doc, options::IndexOptions, Client, Collection, IndexModel};
 use serde::{Deserialize, Serialize};
@@ -73,11 +76,44 @@ struct Claims {
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, ToSchema)]
 struct LoginResponse {
-    token: String,
+    access_token: String,
+    refresh_token: String,
 }
 
 fn get_secret_key() -> String {
     "4a77a9735cb3c1392399955f1c8d27b4f68c13832c574bf21ec7cfbc1c0fb663".to_string()
+}
+
+fn generate_token(username: &str, exp: usize) -> Result<String, ()> {
+    let secret = get_secret_key();
+
+    let claims = Claims {
+        username: username.parse().unwrap(),
+        exp,
+    };
+
+    Ok(encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(secret.as_ref()),
+    )
+        .unwrap_or_else(|_| "".parse().unwrap()))
+}
+
+fn decode_token(token: &str) -> Result<String, String> {
+    let secret = get_secret_key();
+
+    let token_message = decode::<Claims>(
+        token,
+        &DecodingKey::from_secret(secret.as_ref()),
+        &Validation::new(Algorithm::HS256),
+    );
+
+    match token_message {
+        Ok(token) => Ok(token.claims.username.to_string()),
+
+        Err(err) => Err(format!("Token decoded failed with error {:?}", err)),
+    }
 }
 
 #[utoipa::path(
@@ -101,22 +137,34 @@ async fn login(client: web::Data<Client>, form: Json<LoginRequest>) -> HttpRespo
     {
         Ok(Some(user)) => match bcrypt::verify(&login_request.password, &user.pwd_hash) {
             Ok(true) => {
-                let claims = Claims {
-                    username: user.username.clone(),
-                    exp: 10000000000,
+                let current_time = chrono::Utc::now().timestamp() as usize;
+
+                let access_exp = current_time + 900; // 15 * 60 : 15 minutes
+                let access_token = match generate_token(&user.username, access_exp) {
+                    Ok(token) => token,
+                    Err(_) => {
+                        return HttpResponse::InternalServerError()
+                            .body("Error generating access token");
+                    }
                 };
 
-                let secret = get_secret_key();
-                match encode(
-                    &Header::default(),
-                    &claims,
-                    &EncodingKey::from_secret(secret.as_ref()),
-                ) {
-                    Ok(token) => HttpResponse::Ok()
-                        .content_type("application/json")
-                        .json(LoginResponse { token }),
-                    Err(_) => HttpResponse::InternalServerError().body("Error generating JWT"),
-                }
+                let refresh_exp = current_time + 604800; // 7 Day
+                let refresh_token = match generate_token(&user.username, refresh_exp) {
+                    Ok(token) => token,
+                    Err(_) => {
+                        return HttpResponse::InternalServerError()
+                            .body("Error generating refresh token");
+                    }
+                };
+
+                let login_response: LoginResponse = LoginResponse {
+                    access_token: access_token.to_string(),
+                    refresh_token: refresh_token.to_string(),
+                };
+
+                HttpResponse::Ok()
+                    .content_type("application/json")
+                    .json(login_response)
             }
             Ok(false) => HttpResponse::Unauthorized().body("Invalid password"),
             Err(_) => HttpResponse::InternalServerError().body("Error verifying password"),
@@ -150,6 +198,23 @@ async fn create_username_index(client: &Client) {
 )]
 struct ApiDoc;
 
+async fn middleware(
+    req: ServiceRequest,
+    next: Next<impl MessageBody>,
+) -> Result<ServiceResponse<impl MessageBody>, Error> {
+    let bearer = req
+        .headers()
+        .get("Authorization")
+        .ok_or_else(|| error::ErrorUnauthorized("Missing Authorization header"))?
+        .to_str()
+        .map_err(|_| error::ErrorUnauthorized("Invalid Authorization header"))?;
+    let token = &bearer[7..bearer.len()];
+    match decode_token(token) {
+        Ok(..) => next.call(req).await,
+        Err(_) => Err(error::ErrorUnauthorized("Invalid token")),
+    }
+}
+
 #[shuttle_runtime::main]
 async fn main(
     #[shuttle_runtime::Secrets] secrets: SecretStore,
@@ -164,13 +229,22 @@ async fn main(
     let client_data = web::Data::new(client);
 
     let config = move |cfg: &mut web::ServiceConfig| {
-        cfg.app_data(client_data.clone())
-            .service(add_user)
-            .service(get_user)
-            .service(login)
-            .service(
-                SwaggerUi::new("/docs/{_:.*}").url("/api-doc/openapi.json", ApiDoc::openapi()),
-            );
+        cfg.app_data(client_data.clone()).service(
+            web::scope("")
+                .service(add_user)
+                .service(get_user)
+                .service(login)
+                .service(
+                    SwaggerUi::new("/docs/{_:.*}").url("/api-doc/openapi.json", ApiDoc::openapi()),
+                )
+                .service(
+                    web::resource("/test")
+                        .route(web::get().to(HttpResponse::Ok))
+                        .wrap(from_fn(middleware)),
+                )
+                .wrap(middleware::NormalizePath::trim())
+                .wrap(middleware::Logger::default()),
+        );
     };
 
     Ok(config.into())

@@ -1,6 +1,6 @@
 [package]
 name = "shuttle-rust-api"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 authors = ["Maximiien Grzeczka"]
 description = "Shuttle Actix Web API"
@@ -17,3 +17,4 @@ shuttle-actix-web = "0.53.0"
 shuttle-runtime = "0.53.0"
 utoipa = { version = "5.3.1", features = ["actix_extras"] }
 utoipa-swagger-ui = { version = "9.0.0", features = ["actix-web"] }
+chrono = "0.4.40"
